@@ -1,0 +1,431 @@
+import argparse
+import json
+import os
+import random
+import re
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+import requests
+from eval.vllm_inference.data.data_loader import *
+
+from eval.vllm_inference.utils import get_dataset_type
+
+random.seed(42)
+
+
+def get_args():
+    parser = argparse.ArgumentParser(
+        description="Evaluation for training-free video temporal grounding (Single GPU Version)"
+    )
+    parser.add_argument(
+        "--dataset",
+        help="Specify the dataset.",
+    )
+    parser.add_argument("--split", type=str, default="test", help="dataset type")
+    parser.add_argument(
+        "--eval_root",
+        type=str,
+        default="kl_cot_gaussian_03_iouv2_2500",
+        help="model name",
+    )
+    return parser.parse_args()
+
+def compute_IoU_minsec(pred_text, gt):
+    """Compute the IoU given predicted and ground truth windows in minsec format."""
+    """ "output_text": "0min27s to 0min29s"
+    """
+    matches = re.findall(r"(\d+)min(\d+)s", pred_text)
+    if matches:
+        start_min, start_sec = int(matches[0][0]), int(matches[0][1])
+        end_min, end_sec = int(matches[1][0]), int(matches[1][1])
+        pred = [start_min * 60 + start_sec, end_min * 60 + end_sec]
+    else:
+        return 0.0
+    return compute_IoU(pred, gt)
+
+
+def _parse_time_value(time_str):
+    """Parse a time string to seconds; supports plain seconds, mm:ss, hh:mm:ss and xminys."""
+    if not isinstance(time_str, str):
+        return None
+
+    clean = time_str.strip()
+    if not clean:
+        return None
+
+    match_minsec = re.match(r"(\d+)min(\d+)(?:s)?", clean)
+    if match_minsec:
+        minutes, seconds = match_minsec.groups()
+        return int(minutes) * 60 + float(seconds)
+
+    clean = clean.rstrip("sS")
+
+    if ":" in clean:
+        parts = clean.split(":")
+        try:
+            if len(parts) == 3:
+                hours, minutes, seconds = parts
+                return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+            if len(parts) == 2:
+                minutes, seconds = parts
+                return int(minutes) * 60 + float(seconds)
+        except ValueError:
+            return None
+
+    try:
+        return float(clean)
+    except ValueError:
+        return None
+
+
+def compute_IoU_output_text(pred_text, gt):
+    """Compute IoU by parsing time spans encoded as "start to end" in output_text."""
+    if not isinstance(pred_text, str):
+        return 0.0
+
+    spans = re.split(r"\s*to\s*", pred_text.strip())
+    if len(spans) < 2:
+        return 0.0
+
+    start_val = _parse_time_value(spans[0])
+    end_val = _parse_time_value(spans[1])
+    if start_val is None or end_val is None:
+        return 0.0
+
+    return compute_IoU([start_val, end_val], gt)
+
+def merge_intervals(intervals):
+    """合并重叠或相邻的时间区间"""
+    if not intervals:
+        return []
+    intervals = [list(i) for i in intervals]  # tuple to list
+    # 按起始时间排序
+    sorted_intervals = sorted(intervals, key=lambda x: x[0])
+    merged = [sorted_intervals[0][:]]  # 复制第一个区间
+    for current in sorted_intervals[1:]:
+        last = merged[-1]
+        if current[0] <= last[1]:
+            # 合并区间
+            merged[-1][1] = max(last[1], current[1])
+        else:
+            merged.append(current[:])
+    return merged
+
+
+def compute_iou(list_a, list_b):
+    """计算两个时间区间列表的 IoU，支持多个区间合并"""
+    # 合并两个列表的区间
+    merged_a = merge_intervals(list_a)
+    merged_b = merge_intervals(list_b)
+
+    # 计算各自的总长度
+    len_a = sum(end - start for start, end in merged_a)
+    len_b = sum(end - start for start, end in merged_b)
+
+    # 计算交集的总长度
+    intersection = 0
+    i = j = 0
+    while i < len(merged_a) and j < len(merged_b):
+        a_start, a_end = merged_a[i]
+        b_start, b_end = merged_b[j]
+
+        # 计算当前两个区间的重叠部分
+        start = max(a_start, b_start)
+        end = min(a_end, b_end)
+        if start < end:
+            intersection += end - start
+
+        # 移动指针
+        if a_end < b_end:
+            i += 1
+        else:
+            j += 1
+
+    # 计算并集总长度
+    union = len_a + len_b - intersection
+    if union == 0:
+        return 1.0
+
+    return intersection / union
+
+
+def compute_IoU(pred, gt):
+    """Compute the IoU given predicted and ground truth windows.
+    如果 pred 或 gt 包含多个区间（格式为 [[s1, e1], [s2, e2], ...]），
+    使用 compute_iou 函数进行区间合并计算。
+    否则使用原有的单区间计算逻辑。
+    """
+    assert isinstance(pred, list) and isinstance(gt, list)
+    
+    # 检查是否是多个区间的情况
+    # pred 是多个区间：[[s1, e1], [s2, e2], ...] 且长度 > 1
+    # 或者 pred 是嵌套列表格式（即使只有一个区间 [[s1, e1]]，也使用区间合并逻辑以保持一致性）
+    pred_is_nested = len(pred) > 0 and isinstance(pred[0], list)
+    gt_is_nested = len(gt) > 0 and isinstance(gt[0], list)
+    pred_is_multi = pred_is_nested and len(pred) > 1
+    gt_is_multi = gt_is_nested and len(gt) > 1
+    
+    # 如果 pred 或 gt 是嵌套列表格式（多个区间或单个区间的嵌套列表），使用支持区间合并的 compute_iou
+    if pred_is_nested or gt_is_nested:
+        # 确保格式正确：转换为列表的列表
+        if not isinstance(pred[0], list):
+            pred = [pred]
+        if not isinstance(gt[0], list):
+            gt = [gt]
+        # 转换为元组列表格式（compute_iou 需要）
+        pred_tuples = [tuple(p) if isinstance(p, list) else p for p in pred]
+        gt_tuples = [tuple(g) if isinstance(g, list) else g for g in gt]
+        return compute_iou(pred_tuples, gt_tuples)
+    
+    # 原有的单区间计算逻辑（pred 和 gt 都是 [s, e] 格式）
+    pred_is_list = len(pred) > 0 and isinstance(pred[0], list)
+    gt_is_list = len(gt) > 0 and isinstance(gt[0], list)
+    if not pred_is_list:
+        pred = [pred]
+    if not gt_is_list:
+        gt = [gt]
+    pred, gt = np.array(pred), np.array(gt)
+    inter_left = np.maximum(pred[:, 0, None], gt[None, :, 0])
+    inter_right = np.minimum(pred[:, 1, None], gt[None, :, 1])
+    inter = np.maximum(0.0, inter_right - inter_left)
+    union_left = np.minimum(pred[:, 0, None], gt[None, :, 0])
+    union_right = np.maximum(pred[:, 1, None], gt[None, :, 1])
+    union = np.maximum(0.0, union_right - union_left)
+    overlap = 1.0 * inter / union
+    if not gt_is_list:
+        overlap = overlap[:, 0]
+    if not pred_is_list:
+        overlap = overlap[0]
+    return overlap
+
+
+def mcq_is_correct(pred, gt):
+    gt = chr(gt + ord("A"))
+    # matches = re.findall(r"\(([A-Z])\)", pred)
+    matches = re.findall(r"([A-Z]\.)", pred)
+    if matches:
+        return int(matches[0][0] == gt)
+    return int(pred[0] == gt)
+
+
+def load_scored_data(data_dir, dataset_name, split, eval_root=None):
+    """Get and compute scores for all data in data_dir."""
+    # load all jsonl files in data_dir
+    pred_data = []
+    for file in os.listdir(data_dir):
+        if "jsonl" not in file or "score" in file:
+            continue
+        file_path = os.path.join(data_dir, file)
+        pred_data += [json.loads(line) for line in open(file_path)]
+
+    if dataset_name == "auroracap":
+        from eval.vllm_inference.eval_auroracap import get_auroracap_score
+
+        return get_auroracap_score(pred_data, split, eval_root)
+
+    if dataset_name == "youcook2":
+        from eval.vllm_inference.eval_dvc import evaluate_youcook2_dvc
+
+        return evaluate_youcook2_dvc(pred_data)
+
+    datatype = get_dataset_type(dataset_name)
+    data = {}
+    cnt = 0
+    for tmp in pred_data:
+        cnt += 1
+
+        if datatype == "tg":
+            if tmp["pred"] is not None:
+                score = compute_IoU(tmp["pred"], tmp["target"])
+            elif tmp["pred"] is None and "min" in tmp["output_text"]:
+                score = compute_IoU_minsec(tmp["output_text"], tmp["target"])
+            else:
+                score = compute_IoU_output_text(tmp.get("output_text", ""), tmp["target"])
+        elif datatype == "mcq":
+            if tmp["pred"] is not None:
+                score = int(tmp["pred"] == tmp["target"])
+            else:
+                score = mcq_is_correct(tmp["output_text"], tmp["target"])
+        elif datatype == "caption":
+            raise NotImplementedError
+
+        # save different data for different datasets
+        if dataset_name in ["videomme", "longvideobench"]:
+            data[tmp["qid"]] = {
+                "score": score,
+                "duration": tmp["duration"],
+                "task_type": tmp["task_type"],
+            }
+        elif dataset_name in ["lvbench", "mlvu", "cgbench", "tempcompass"]:
+            data[tmp["qid"]] = {
+                "score": score,
+                "task_type": tmp["task_type"],
+            }
+        else:
+            data[tmp["qid"]] = score
+    return data
+
+
+def calc_score(difficulty_data_dict, datasetname):
+    if datasetname in ["youcook2"]:
+        scores = {}
+        scores["total"] = len(difficulty_data_dict["key"])
+        for k, v in difficulty_data_dict.items():
+            if k == "key":
+                continue
+            if "Para_" in k:
+                scores[k] = round(v, 1)
+            elif k == "n_preds":
+                scores[k] = round(sum(v) / len(v), 1)
+            else:
+                scores[k] = round(sum(v) / len(v) * 100, 1)
+        return scores
+
+    data = list(difficulty_data_dict.values())
+    if datasetname in ["activitynet", "charades", "tvgbench", "qvhighlights"]:
+        scores = {}
+        scores["mIoU"] = np.mean([itm for itm in data]) * 100
+        for i in [0.3, 0.5, 0.7]:
+            cnt = len([itm for itm in data if itm > i])
+            score = cnt / len(difficulty_data_dict) * 100.0
+            scores[f"IoU R1@{i}"] = score
+        scores["avg"] = sum(scores.values()) / len(scores)
+    elif datasetname in ["videomme", "longvideobench"]:
+        # save all scores corresponding to different task_types, durations and total scores:
+        scores = {}
+        scores["total"] = {
+            "correct": sum([itm["score"] for itm in data]),
+            "total": len(data),
+            "avg": round(sum([itm["score"] for itm in data]) / len(data) * 100, 2),
+        }
+        for itm in data:
+            task_type = itm["task_type"]
+            duration = itm["duration"]
+            if task_type not in scores:
+                scores[task_type] = {"correct": 0, "total": 0}
+            if duration not in scores:
+                scores[duration] = {"correct": 0, "total": 0}
+            scores[duration]["correct"] += itm["score"]
+            scores[duration]["total"] += 1
+            scores[task_type]["correct"] += itm["score"]
+            scores[task_type]["total"] += 1
+        for key in scores:
+            scores[key]["avg"] = round(
+                scores[key]["correct"] / scores[key]["total"] * 100, 2
+            )
+    elif datasetname in ["lvbench", "mlvu", "cgbench", "tempcompass"]:  # 按 task_type 分类
+        scores = defaultdict(lambda: {"correct": 0, "total": 0})
+        for itm in data:
+            task_types = itm["task_type"]
+            if not isinstance(task_types, list):  # handle mlvu
+                task_types = [task_types]
+            for task_type in task_types:
+                scores["total"]["correct"] += itm["score"]
+                scores["total"]["total"] += 1
+                scores[task_type]["correct"] += itm["score"]
+                scores[task_type]["total"] += 1
+        for key in scores:
+            scores[key]["avg"] = round(
+                scores[key]["correct"] / scores[key]["total"] * 100, 2
+            )
+    elif datasetname == "auroracap":  # 按 task_type 分类，有 score 和 acc
+        scores = defaultdict(lambda: {"total": 0, "score": 0.0, "acc": 0.0})
+        for itm in data:
+            task_type = itm["task_type"]
+            scores["total"]["score"] += itm["score"]
+            scores["total"]["acc"] += itm["acc"]
+            scores["total"]["total"] += 1
+            scores[task_type]["score"] += itm["score"]
+            scores[task_type]["acc"] += itm["acc"]
+            scores[task_type]["total"] += 1
+        for key in scores:
+            scores[key]["score"] = round(scores[key]["score"] / scores[key]["total"], 2)
+            scores[key]["acc"] = round(
+                scores[key]["acc"] / scores[key]["total"] * 100, 2
+            )
+    else:
+        correct = sum([itm for itm in data])
+        scores = {
+            "correct": correct,
+            "total": len(data),
+            "avg": round(correct / len(data) * 100, 2),
+        }
+    return scores
+
+
+def upload_json_to_server(
+    data, api_url="https://validation-server.onrender.com/api/upload/"
+):
+    headers = {"Content-Type": "application/json"}
+    try:
+        response = requests.post(url=api_url, headers=headers, json=data)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return {"status": "success", "response_text": response.text}
+
+    except requests.exceptions.RequestException as e:
+        return {
+            "status": "error",
+            "message": str(e),
+            "details": f"Failed to upload data to {api_url}",
+        }
+
+
+def eval_egoschema_online(data_dir, original_data):
+    qid_to_vid = {}
+    for itm in original_data:
+        qid, vid = itm["qid"], itm["video"].split("/")[-1].split(".")[0]
+        qid_to_vid[qid] = vid
+
+    data = {}
+    for file in os.listdir(data_dir):
+        if "jsonl" not in file:
+            continue
+        file_path = os.path.join(data_dir, file)
+        for line in open(file_path):
+            tmp = json.loads(line)
+            matches = re.findall(r"\(([A-Z])\)", tmp["output_text"])
+            if matches:
+                pred = ord(matches[-1]) - ord("A")
+            else:
+                pred = ord(random.choice(["A", "B", "C", "D", "E"])) - ord("A")
+            data[qid_to_vid[tmp["qid"]]] = pred
+
+    return upload_json_to_server(data)
+
+
+def main(args):
+    dataset = args.dataset
+    original_data = None
+    if original_data is not None:
+        print(f"Original data length: {len(original_data)}")
+
+    for data_dir in [args.eval_root]:
+        if dataset == "egoschema":
+            results_ego = eval_egoschema_online(data_dir, original_data)
+            print(results_ego)
+            with open(data_dir + "/scores.json", "w") as f:
+                json.dump(results_ego, f, indent=4)
+            continue
+
+        difficulty_data_dict = load_scored_data(
+            data_dir, dataset, args.split, eval_root=args.eval_root
+        )
+        if len(difficulty_data_dict) == 0:
+            continue
+        print(f"len(difficulty_data_dict): {len(difficulty_data_dict)}")
+
+        score_dict = calc_score(difficulty_data_dict, dataset)
+        for k, v in score_dict.items():
+            print(f"{k}: {v}")
+        with open(data_dir + "/scores.json", "w") as f:
+            json.dump(score_dict, f, indent=4)
+
+
+if __name__ == "__main__":
+    args = get_args()
+    main(args)

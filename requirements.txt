@@ -1,0 +1,8 @@
+torch
+transformers
+ms-swift
+deepspeed
+vllm
+flash-attn
+json5
+numpy
